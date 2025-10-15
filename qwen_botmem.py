@@ -6,13 +6,39 @@ import json
 import os
 import sys
 
+import torch
+import torch.nn.functional as F
+import re
+from typing import Dict, Tuple
+import sys
+
 class BagOfTransformsV4:
     """
-    Hybrid approach: Combines embedding steering with implicit context injection.
-    Uses aggressive transform scaling and strategic token replacement for reliable steering.
+    Hybrid memory system designed for robust and reliable entity recall in Language Models.
+
+    This class combines two powerful memory injection techniques:
+    1. Implicit Memory: Using structured data to synthesize a natural language prompt prefix
+       (traditional prompt engineering).
+    2. Explicit Memory: Aggressively scaling a semantic memory vector (the "Bag of Transforms")
+       and surgically replacing/blending it into the input token embeddings (latent space steering).
+
+    The system stores memory as both structured attributes and a highly weighted vector,
+    ensuring that factual knowledge biases the model both linguistically and sub-symbolically.
     """
     
     def __init__(self, model_name="Qwen/Qwen2.5-7B-Instruct", force_offline=False):
+        """
+        Initializes the BagOfTransformsV4 hybrid memory system.
+
+        This sets up the underlying Language Model (LM), loads the tokenizer,
+        and calibrates the average token embedding norm, which is crucial for
+        determining the necessary aggressive scaling factor used during
+        embedding steering.
+
+        Args:
+            model_name (str): The name of the Qwen model to load.
+            force_offline (bool): Whether to force loading in offline mode.
+        """
         try:
             from qwen_ import load_model
         except ImportError:
@@ -29,10 +55,18 @@ class BagOfTransformsV4:
         self.device = self.model.device
         
         self._calibrate_norms()
-        print(f"✓ Model loaded ({model_name}). Embedding dimension: {self.embedding_dim}")
+        print(f"✓ Model loaded (). Embedding dimension: {self.embedding_dim}")
     
     def _calibrate_norms(self):
-        """Measure typical token embedding norms."""
+        """
+        Measures the typical L2 norm (magnitude) of token embeddings in the vocabulary.
+
+        This calibration step is essential for the embedding steering mechanism.
+        The resulting `self.avg_token_norm` is used to scale newly created memory
+        embeddings aggressively (to approximately 4.5 times the average),
+        ensuring the injected vector exerts a strong, dominant influence on the
+        model's initial layer computation.
+        """
         sample_tokens = ["cat", "person", "Google", "fish", "seven", "works", "likes"]
         norms = []
         
@@ -46,10 +80,23 @@ class BagOfTransformsV4:
                 norms.append(emb.norm(dim=-1).mean().item())
         
         self.avg_token_norm = sum(norms) / len(norms) if norms else 1.0
-        print(f"   Average token embedding norm: {self.avg_token_norm:.4f}")
+        print(f" Average token embedding norm: {self.avg_token_norm:.4f}")
     
     def _get_embedding_vector(self, text: str) -> torch.Tensor:
-        """Get mean embedding for text, returns [D]."""
+        """
+        Calculates the mean embedding vector for a given piece of text.
+
+        This function tokenizes the input text, retrieves the individual token
+        embeddings from the model's embedding layer, and computes the arithmetic
+        mean of these vectors. This resulting vector is used as the foundational
+        semantic representation for entity memory creation.
+
+        Args:
+            text (str): The input string (e.g., entity description or key facts).
+
+        Returns:
+            torch.Tensor: A tensor of shape [D] representing the mean embedding.
+        """
         tokens = self.tokenizer(text, add_special_tokens=False, return_tensors="pt")
         ids = tokens['input_ids'].to(self.device)
         
@@ -63,8 +110,19 @@ class BagOfTransformsV4:
     
     def extract_attributes_simple(self, description: str) -> Dict[str, float]:
         """
-        Simplified attribute extraction focusing on key facts.
-        Returns structured attributes that can be easily injected.
+        Analyzes a natural language description to extract structured key attributes.
+
+        This function uses regex and simple keyword matching to parse explicit facts
+        (e.g., age, type, workplace, preferences). The resulting dictionary of
+        attributes is critical for the "implicit memory" component, as it allows
+        `_inject_context_prefix` to synthesize a grammatically correct, factual
+        prompt prefix that primes the model via standard prompt engineering.
+
+        Args:
+            description (str): The entity's full natural language description.
+
+        Returns:
+            Dict[str, float]: A dictionary containing structured facts.
         """
         attributes = {}
         desc_lower = description.lower()
@@ -99,7 +157,7 @@ class BagOfTransformsV4:
         if "black and white" in desc_lower:
             attributes['appearance'] = "black and white fur"
 
-        # Physical description
+        # Physical description (Car specific)
         if "silver and white" in desc_lower:
             attributes['appearance'] = "silver and white trim"
 
@@ -111,18 +169,40 @@ class BagOfTransformsV4:
         if "high-octane fuel" in desc_lower:
             attributes['likes'] = "high-octane fuel"
         
+        # Fictional Car/Chemical attributes (added context)
+        if "high-performance" in desc_lower:
+             attributes['performance'] = "high-performance"
+        if "energetic" in desc_lower:
+             attributes['danger'] = "energetic"
+        if "manufactured by" in desc_lower:
+             attributes['make'] = "foreign made"
+        
         return attributes
     
     def create_entity_memory(self, name: str, description: str):
         """
-        Store entity memory as structured data + embedding.
+        Stores an entity's memory, consisting of structured attributes and an
+        aggressively scaled latent vector ("Bag of Transforms").
+
+        The process involves:
+        1. Extracting structured attributes (for implicit injection via prompt prefixing).
+        2. Creating a blended semantic embedding (70% key facts, 30% description) to focus
+           the memory vector primarily on core attributes.
+        3. Scaling this combined embedding vector to 4.5 times the average token norm.
+           This hyper-scaling is the core of the 'explicit memory' method, ensuring that
+           the injected vector dominates the original token embedding's influence during
+           `apply_embedding_steering`.
+
+        Args:
+            name (str): The unique identifier for the entity (e.g., "Mickey").
+            description (str): The full textual description of the entity.
         """
         print(f"\n📝 Creating memory for '{name}'...")
-        print(f"   Description: '{description}'")
+        print(f"Description: '{description}'")
         
         # Extract structured attributes
         attributes = self.extract_attributes_simple(description)
-        print(f"   Extracted attributes: {attributes}")
+        print(f"Extracted attributes: {attributes}")
         
         # Create embedding from description
         desc_embedding = self._get_embedding_vector(description)
@@ -141,7 +221,7 @@ class BagOfTransformsV4:
             key_facts.append(f"enjoys {attributes['hobby']}")
         
         key_facts_text = ", ".join(key_facts)
-        print(f"   Key facts: {key_facts_text}")
+        print(f"Key facts: {key_facts_text}")
         
         key_facts_embedding = self._get_embedding_vector(key_facts_text)
         
@@ -149,11 +229,11 @@ class BagOfTransformsV4:
         combined_embedding = 0.7 * key_facts_embedding + 0.3 * desc_embedding
         
         # Normalize and scale aggressively
-        # Target: 4-5x average token norm for strong steering
+        # Target: 4.5x average token norm for strong steering
         target_norm = 4.5 * self.avg_token_norm
         final_embedding = F.normalize(combined_embedding, dim=0) * target_norm
         
-        print(f"   Memory embedding norm: {final_embedding.norm().item():.4f}")
+        print(f"Memory embedding norm: {final_embedding.norm().item():.4f}")
         
         # Store everything
         self.entity_memories[name] = {
@@ -163,12 +243,25 @@ class BagOfTransformsV4:
             'key_facts': key_facts_text
         }
         
-        print(f"   ✓ Memory created for '{name}'")
+        print(f"✓ Memory created for '{name}'")
     
     def _inject_context_prefix(self, text: str, entity_name: str) -> str:
         """
-        Create an implicit context prefix that primes the model.
-        This is the key: we inject the memory as PART OF THE PROMPT structure.
+        Creates a grammatically natural context prefix from the stored structured
+        attributes and prepends it to the user's input text.
+
+        This mechanism implements the 'implicit memory' component of the hybrid
+        approach. By injecting factual context directly into the prompt structure,
+        it primes the Language Model to recall specific details, effectively
+        acting as a robust baseline memory retrieval technique that complements
+        the lower-level embedding steering.
+
+        Args:
+            text (str): The user's original query.
+            entity_name (str): The entity whose memory should be injected.
+
+        Returns:
+            str: The augmented prompt string, or the original text if no memory exists.
         """
         if entity_name not in self.entity_memories:
             return text
@@ -185,6 +278,7 @@ class BagOfTransformsV4:
         if 'age' in attrs:
             context_parts.append(f"{attrs['age']} years old")
         
+        # Attributes specific to non-human entities
         if 'performance' in attrs:
             context_parts.append(f"chemical {attrs['performance']}")
         if 'danger' in attrs:
@@ -222,13 +316,36 @@ class BagOfTransformsV4:
         boost_factor: float = 1.0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply aggressive embedding steering to entity tokens.
-        Returns: (modified_embeddings, attention_mask)
+        Applies aggressive, targeted embedding steering by modifying the input
+        token embeddings at the position of the entity name.
+
+        This is the 'explicit memory' mechanism.
+        1. The entity name tokens are located using offset mapping.
+        2. The memory vector (the 'Bag of Transforms'), which was previously
+           aggressively scaled (4.5x norm), is retrieved.
+        3. The primary entity token embedding is overwritten/blended with the
+           memory vector using a high blend ratio (80% to 95%), effectively
+           replacing the token's original semantic meaning with the stored fact vector.
+           The use of the `boost_factor` further controls the blend aggression.
+        4. Neighboring tokens receive a lesser blend (up to 50%) to diffuse the
+           memory influence locally into the surrounding context.
+
+        Args:
+            text (str): The full input text (potentially including the context prefix).
+            entity_name (str): The name of the entity to steer.
+            boost_factor (float): Multiplier for the memory vector strength and blend ratio.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: (modified_embeddings, attention_mask)
         """
         if entity_name not in self.entity_memories:
-            raise ValueError(f"No memory found for '{entity_name}'")
-        
-        # Tokenize
+            # If no memory, return base embeddings for the text
+            tokens = self.tokenizer(text, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                 base_embeddings = self.embedding_layer(tokens['input_ids'])
+            return base_embeddings, tokens['attention_mask']
+
+        # Tokenize and get positional info
         tokens = self.tokenizer(text, return_tensors="pt", return_offsets_mapping=True, truncation=True)
         token_ids = tokens['input_ids'].to(self.device)
         attention_mask = tokens['attention_mask'].to(self.device)
@@ -244,13 +361,15 @@ class BagOfTransformsV4:
         
         entity_end = entity_start + len(entity_name)
         
-        # Find entity tokens
+        # Find entity tokens (handles multi-token names)
         entity_token_indices = []
         for i, (start, end) in enumerate(offset_mapping):
+            # Check for overlap between token span and entity span
             if start < entity_end and end > entity_start:
                 entity_token_indices.append(i)
         
         if not entity_token_indices:
+            # Fallback if tokenizer splits in an unrecoverable way
             with torch.no_grad():
                 base_embeddings = self.embedding_layer(token_ids)
             return base_embeddings, attention_mask
@@ -266,13 +385,12 @@ class BagOfTransformsV4:
         scaled_memory = memory_embedding * boost_factor
         
         # AGGRESSIVE REPLACEMENT STRATEGY
-        # Replace the entity token embedding with a heavily weighted memory injection
         primary_idx = entity_token_indices[0]
         
         # Strategy: Blend with high memory weight
-        # New = 20% original + 80% memory (when boost=1.0)
-        blend_ratio = 0.8 * boost_factor  # Scale blend ratio with boost
-        blend_ratio = min(blend_ratio, 0.95)  # Cap at 95%
+        # Blend is capped at 95% to maintain a small residue of the original token meaning.
+        blend_ratio = 0.8 * boost_factor
+        blend_ratio = min(blend_ratio, 0.95)
         
         original = modified_embeddings[0, primary_idx]
         modified_embeddings[0, primary_idx] = (1 - blend_ratio) * original + blend_ratio * scaled_memory
@@ -280,7 +398,7 @@ class BagOfTransformsV4:
         # Also inject (with less strength) into surrounding tokens
         for offset in [-1, 1]:
             neighbor_idx = primary_idx + offset
-            if 0 <= neighbor_idx < len(modified_embeddings[0]):
+            if 0 <= neighbor_idx < modified_embeddings.shape[1]:
                 neighbor_original = modified_embeddings[0, neighbor_idx]
                 neighbor_blend = 0.3 * boost_factor
                 neighbor_blend = min(neighbor_blend, 0.5)
@@ -298,9 +416,30 @@ class BagOfTransformsV4:
         temperature: float = 0.7
     ) -> str:
         """
-        Generate with entity memory using hybrid approach:
-        1. Optional context prefix (implicit memory)
-        2. Embedding steering (explicit memory)
+        Orchestrates the generation process using the hybrid memory system.
+
+        The process integrates both memory mechanisms:
+        1. Implicit Memory (Optional): If `use_context_prefix` is True, a natural
+           language factual summary is prepended to the input text via
+           `_inject_context_prefix`.
+        2. Explicit Memory: The resulting (potentially modified) text is then
+           tokenized, and `apply_embedding_steering` is called to aggressively
+           inject the highly scaled memory vector directly into the input
+           embeddings at the position of the entity name.
+
+        The modified embedding sequence is then passed to the Language Model for
+        generation, ensuring the response is strongly biased by the stored facts.
+
+        Args:
+            text (str): The user's query.
+            entity_name (str): The entity key for memory retrieval.
+            boost_factor (float): Strength multiplier for embedding steering.
+            use_context_prefix (bool): Whether to use prompt prefixing.
+            max_new_tokens (int): Maximum tokens to generate.
+            temperature (float): Sampling temperature.
+
+        Returns:
+            str: The generated response.
         """
         # Step 1: Add context prefix if enabled
         if use_context_prefix:
@@ -331,6 +470,7 @@ class BagOfTransformsV4:
                 eos_token_id=self.tokenizer.eos_token_id
             )
         
+        # Decode only the newly generated tokens
         prompt_len = modified_embeddings.shape[1]
         return self.tokenizer.decode(outputs[0, prompt_len:], skip_special_tokens=True)
     
@@ -359,7 +499,7 @@ class BagOfTransformsV4:
             print(f"{'='*80}")
             
             if method_name.startswith("Baseline"):
-                # Pure baseline
+                # Pure baseline generation (no memory injection whatsoever)
                 tokens = self.tokenizer(text, return_tensors="pt").to(self.device)
                 with torch.no_grad():
                     outputs = self.model.generate(
@@ -380,8 +520,7 @@ class BagOfTransformsV4:
                     temperature=0.7
                 )
             
-            print(f"\n📄 OUTPUT:\n{result}\n")
-
+            print(f"\n📄 OUTPUT:\n\n{result}")
 
 # Example usage
 if __name__ == "__main__":
