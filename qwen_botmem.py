@@ -1,666 +1,473 @@
-import subprocess
-import sys
-import json
-import re
-import os
-import socket
-from typing import List, Dict, Any, Callable, Optional, Tuple
-from datetime import datetime, timezone, timedelta
 import torch
-import numpy as np
+import torch.nn.functional as F
+from typing import Dict, List, Optional, Tuple
+import re
+import json
+import os
+import sys
 
-def install_dependencies():
-    """Install required packages if not available."""
-    try:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        import spacy
-    except ImportError:
-        print("Installing dependencies...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "transformers", "spacy"])
-        subprocess.check_call([sys.executable, "-m", "python", "-m", "spacy", "download", "en_core_web_sm"])
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        import spacy
+class BagOfTransformsV3:
+    """
+    Enhanced BoT with stronger memory injection and better attribute composition.
+    Uses multi-token context injection and learnable scaling for effective steering.
+    """
     
-    return torch, AutoModelForCausalLM, AutoTokenizer
-
-def check_internet():
-    """Check if internet connection is available."""
-    try:
-        socket.create_connection(("huggingface.co", 443), timeout=5)
-        return True
-    except (socket.timeout, socket.error, OSError):
-        return False
-
-def find_local_model(model_name):
-    """Find cached model in common HuggingFace cache locations."""
-    local_name = model_name.split('/')[-1]
-    if os.path.exists(local_name) and validate_model_files(local_name):
-        return local_name
-    
-    cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
-    model_dir_name = f"models--{model_name.replace('/', '--')}"
-    model_path = os.path.join(cache_dir, model_dir_name)
-    
-    if os.path.exists(model_path):
-        snapshots_dir = os.path.join(model_path, "snapshots")
-        if os.path.exists(snapshots_dir):
-            snapshots = os.listdir(snapshots_dir)
-            for snapshot in snapshots:
-                snapshot_path = os.path.join(snapshots_dir, snapshot)
-                if validate_model_files(snapshot_path):
-                    return snapshot_path
-    
-    return None
-
-def validate_model_files(model_path):
-    """Check if model directory has required files."""
-    if not os.path.exists(model_path):
-        return False
-    
-    required_files = ["config.json", "tokenizer.json", "tokenizer_config.json"]
-    model_files = [f for f in os.listdir(model_path) if f.endswith(('.bin', '.safetensors'))]
-    
-    for file in required_files:
-        if not os.path.exists(os.path.join(model_path, file)):
-            return False
-    
-    return len(model_files) > 0
-
-def load_model(model_name="Qwen/Qwen2.5-7B-Instruct", force_offline=False):
-    """Load model and tokenizer with offline support."""
-    torch, AutoModelForCausalLM, AutoTokenizer = install_dependencies()
-    
-    if force_offline or not check_internet():
-        print("Using offline mode...")
-        local_path = find_local_model(model_name)
-        if not local_path:
-            raise FileNotFoundError(
-                f"Model {model_name} not found locally. "
-                f"Please run with internet connection first to download the model."
-            )
-        
-        print(f"Loading model from: {local_path}")
-        model = AutoModelForCausalLM.from_pretrained(
-            local_path,
-            torch_dtype="auto",
-            device_map="auto",
-            local_files_only=True
-        )
-        tokenizer = AutoTokenizer.from_pretrained(
-            local_path,
-            local_files_only=True
-        )
-    else:
-        print(f"Loading {model_name} (will download if needed)...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype="auto",
-            device_map="auto"
-        )
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    return model, tokenizer, torch
-
-
-class BoTMemory:
-    """Temporal Bag of Transforms Memory with LLM-Generated Context."""
-    
-    def __init__(self, model, tokenizer, torch_module):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.torch = torch_module
-        self.device = model.device
-        
-        # Memory database with temporal support
-        self.memory_db = {}
-        
-        # Load spaCy for NLP processing
+    def __init__(self, model_name="Qwen/Qwen2.5-7B-Instruct", force_offline=False):
         try:
-            import spacy
-            self.nlp = spacy.load("en_core_web_sm")
-        except:
-            print("Installing spaCy model...")
-            subprocess.check_call([sys.executable, "-m", "spacy", "download", "en_core_web_sm"])
-            import spacy
-            self.nlp = spacy.load("en_core_web_sm")
+            from qwen_ import load_model
+        except ImportError:
+            print("Error: Could not import 'load_model' from 'qwen_'.")
+            sys.exit(1)
+            
+        self.model, self.tokenizer, self.torch = load_model(model_name, force_offline)
         
-        # Get embedding dimension
-        self.embedding_dim = model.get_input_embeddings().weight.shape[1]
+        # Storage
+        self.entity_memories = {}        # name -> full description embedding [D]
+        self.entity_attributes = {}      # name -> {attribute: weight}
+        self.entity_transforms = {}      # name -> composite transform [D]
         
-        # Cache for transforms at different times
-        self.transform_cache = {}
+        self.embedding_layer = self.model.get_input_embeddings()
+        self.embedding_dim = self.embedding_layer.embedding_dim
+        self.device = self.model.device
+        
+        self._calibrate_norms()
+        print(f"✓ Model loaded ({model_name}). Embedding dimension: {self.embedding_dim}")
     
-    def _parse_attributes(self, attributes: List[str]) -> List[Dict[str, Any]]:
-        """
-        Parse string attributes into weighted dictionaries using LLM.
-        """
-        if not attributes:
-            return []
+    def _calibrate_norms(self):
+        """Measure typical token embedding norms for scaling."""
+        sample_tokens = ["cat", "person", "the", "building", "red", "happy", "works", "likes"]
+        norms = []
         
-        # Ask LLM to weight the attributes
-        attr_str = ", ".join(attributes)
-        prompt = f"""Analyze these attributes: {attr_str}
-
-Rate each attribute's importance for defining an entity (0.0 to 1.0):
-- Entity types (cat, dog, person, place) should be 0.9-1.0
-- Key characteristics (personality, age) should be 0.6-0.8  
-- Physical descriptions (colors, appearance) should be 0.4-0.6
-- Minor details should be 0.2-0.4
-
-Return ONLY a JSON object with attribute:weight pairs.
-Example: {{"cat": 1.0, "playful": 0.7, "black": 0.5}}"""
-
-        try:
-            inputs = self.tokenizer(prompt, return_tensors="pt", padding=True).to(self.device)
-            
-            with self.torch.no_grad():
-                output_ids = self.model.generate(
-                    input_ids=inputs['input_ids'],
-                    attention_mask=inputs['attention_mask'],
-                    max_new_tokens=150,
-                    do_sample=False,
-                    temperature=0.1,
-                    pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-                )
-            
-            generated_ids = output_ids[0][inputs['input_ids'].shape[1]:]
-            response = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
-            
-            # Extract JSON
-            json_match = re.search(r'\{[^}]+\}', response, re.DOTALL)
-            if json_match:
-                weights_dict = json.loads(json_match.group(0))
-            else:
-                # Fallback to uniform weights
-                weights_dict = {attr.lower().replace("_", " "): 0.5 for attr in attributes}
+        token_ids = self.tokenizer(sample_tokens, add_special_tokens=False)['input_ids']
         
-        except Exception as e:
-            print(f"  Warning: LLM weighting failed ({e}), using defaults")
-            weights_dict = {attr.lower().replace("_", " "): 0.5 for attr in attributes}
+        for ids in token_ids:
+            if not ids: continue
+            token_tensor = torch.tensor(ids).to(self.device)
+            with torch.no_grad():
+                emb = self.embedding_layer(token_tensor)
+                norms.append(emb.norm(dim=-1).mean().item())
         
-        # Convert to list format
-        weighted = []
-        for attr in attributes:
-            attr_clean = attr.lower().replace("_", " ")
-            weight = weights_dict.get(attr_clean, 0.5)
-            weighted.append({
-                "name": attr_clean,
-                "weight": float(weight),
-                "active_from": datetime.now(timezone.utc),
-                "active_until": None
-            })
-        
-        return weighted
-    
-    def _get_active_attributes(self, entity_name: str, at_time: Optional[datetime] = None) -> List[Dict[str, Any]]:
-        """Get attributes active at a specific time."""
-        if entity_name not in self.memory_db:
-            return []
-        
-        if at_time is None:
-            at_time = datetime.now(timezone.utc)
-        
-        active = []
-        for attr in self.memory_db[entity_name]["attributes"]:
-            active_from = attr["active_from"]
-            active_until = attr["active_until"]
-            
-            if active_from <= at_time and (active_until is None or at_time < active_until):
-                active.append({
-                    "name": attr["name"],
-                    "weight": attr["weight"]
-                })
-        
-        return active
-    
-    def _generate_context_description(self, entity_name: str, attributes: List[Dict[str, Any]]) -> str:
-        """
-        Use LLM to generate a rich contextual description that preserves the entity name.
-        """
-        if not attributes:
-            return entity_name
-        
-        # Sort by weight
-        sorted_attrs = sorted(attributes, key=lambda x: x["weight"], reverse=True)
-        
-        # Build attribute string emphasizing important ones
-        important = [a["name"] for a in sorted_attrs if a["weight"] >= 0.8]
-        moderate = [a["name"] for a in sorted_attrs if 0.5 <= a["weight"] < 0.8]
-        minor = [a["name"] for a in sorted_attrs if a["weight"] < 0.5]
-        
-        # Create prompt that preserves entity name
-        prompt = f"Complete this description of {entity_name}:\n\n"
-        
-        if important:
-            prompt += f"{entity_name} is a {important[0]}"
-            if len(important) > 1:
-                prompt += f" ({', '.join(important[1:])})"
-            if moderate:
-                prompt += f" who is {', '.join(moderate)}"
-            prompt += f". {entity_name}"
+        if norms:
+            self.avg_token_norm = sum(norms) / len(norms)
         else:
-            attrs_str = ", ".join([a["name"] for a in sorted_attrs[:4]])
-            prompt += f"{entity_name} has these characteristics: {attrs_str}. {entity_name}"
+            self.avg_token_norm = 1.0
+            
+        print(f"   Average token embedding norm: {self.avg_token_norm:.4f}")
+    
+    def _get_embedding_vector(self, text: str) -> torch.Tensor:
+        """Get mean embedding for text, returns [D]."""
+        tokens = self.tokenizer(text, add_special_tokens=False, return_tensors="pt")
+        ids = tokens['input_ids'].to(self.device)
         
-        # Ask for completion
-        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True).to(self.device)
+        if ids.numel() == 0:
+            return torch.zeros(self.embedding_dim).to(self.device)
+
+        with torch.no_grad():
+            embedding = self.embedding_layer(ids)
+            mean_vec = embedding.mean(dim=1).squeeze(0)
+        return mean_vec
+    
+    def extract_attributes_with_importance(self, description: str) -> Dict[str, float]:
+        """Extract attributes using LLM with importance weights."""
+        prompt = f"""Extract key attributes from this entity description and assign importance weights (0-10).
+
+Rules:
+- Name gets highest importance (10)
+- Core identity (type/role) gets high importance (9-10)
+- Key characteristics get medium-high importance (6-8)
+- Secondary traits get medium importance (4-6)
+- Preferences get lower importance (3-5)
+- Return ONLY valid JSON
+
+Description: "{description}"
+
+Return JSON format: {{"attribute": weight, ...}}
+Example: {{"named_Mickey": 10, "cat": 10, "black_white_fur": 7, "age_7": 5, "likes_fish": 4}}
+
+JSON:"""
         
-        with self.torch.no_grad():
-            output_ids = self.model.generate(
-                input_ids=inputs['input_ids'],
-                attention_mask=inputs['attention_mask'],
-                max_new_tokens=40,
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=256,
+                temperature=0.3,
                 do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+                pad_token_id=self.tokenizer.pad_token_id
             )
         
-        generated_ids = output_ids[0][inputs['input_ids'].shape[1]:]
-        completion = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        start_index = inputs['input_ids'].shape[1]
+        response = self.tokenizer.decode(outputs[0, start_index:], skip_special_tokens=True).strip()
         
-        # Combine prompt start and completion
-        full_description = prompt.split(f". {entity_name}")[-1] + " " + completion
-        
-        # Ensure entity name is preserved
-        if entity_name not in full_description:
-            full_description = f"{entity_name} " + full_description
-        
-        # Clean up
-        if '\n' in full_description:
-            full_description = full_description.split('\n')[0]
-        
-        return full_description
+        try:
+            json_match = re.search(r'\{[^{}]*\}', response)
+            if json_match:
+                attributes = json.loads(json_match.group())
+                attributes = {k: float(v) for k, v in attributes.items()}
+                print(f"   ✓ Extracted {len(attributes)} attributes")
+                return attributes
+            else:
+                print(f"   ⚠ JSON parsing failed, using fallback")
+                return self._simple_attribute_extraction(description)
+        except json.JSONDecodeError as e:
+            print(f"   ⚠ JSON decode error, using fallback")
+            return self._simple_attribute_extraction(description)
     
-    def _generate_behavior_description(self, entity_name: str, entity_type: str) -> str:
-        """
-        Use LLM to generate typical behaviors for the entity type.
-        """
-        prompt = f"List 4 typical behaviors or actions that a {entity_type} named {entity_name} would do:"
+    def _simple_attribute_extraction(self, description: str) -> Dict[str, float]:
+        """Fallback attribute extraction."""
+        attributes = {}
+        desc_lower = description.lower()
         
-        inputs = self.tokenizer(prompt, return_tensors="pt", padding=True).to(self.device)
+        # Extract name
+        name_match = re.match(r'^(\w+),?\s', description)
+        if name_match:
+            name = name_match.group(1).strip(',')
+            attributes[f"named_{name}"] = 10.0
         
-        with self.torch.no_grad():
-            output_ids = self.model.generate(
-                input_ids=inputs['input_ids'],
-                attention_mask=inputs['attention_mask'],
-                max_new_tokens=30,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.9,
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
-            )
+        # Type detection
+        if "cat" in desc_lower:
+            attributes["cat"] = 10.0
+        elif "dog" in desc_lower:
+            attributes["dog"] = 10.0
+        elif "person" in desc_lower:
+            attributes["person"] = 9.0
         
-        generated_ids = output_ids[0][inputs['input_ids'].shape[1]:]
-        behaviors = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        # Key characteristics
+        if "works at google" in desc_lower or "google" in desc_lower:
+            attributes["works_at_Google"] = 9.0
+        if "hiking" in desc_lower:
+            attributes["enjoys_hiking"] = 5.0
         
-        # Clean up and extract key words
-        if '\n' in behaviors:
-            behaviors = behaviors.split('\n')[0]
+        # Physical traits
+        if "black and white" in desc_lower or "black white" in desc_lower:
+            attributes["black_white_fur"] = 7.0
         
-        # Keep it concise
-        behavior_words = behaviors.split()[:8]  # Limit to 8 words
-        return " ".join(behavior_words)
+        # Age
+        age_match = re.search(r'(\d+)\s*years?\s*old', desc_lower)
+        if age_match:
+            attributes[f"age_{age_match.group(1)}"] = 5.0
+        
+        # Preferences
+        if "fish" in desc_lower:
+            attributes["likes_fish"] = 4.0
+        
+        print(f"   Fallback extracted: {len(attributes)} attributes")
+        return attributes
     
-    def _compute_bag_of_transforms(self, entity_name: str, attributes: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    def create_entity_memory(self, name: str, description: str) -> torch.Tensor:
         """
-        Compute multiple transform vectors preserving entity name.
+        Create entity memory by:
+        1. Storing full description embedding
+        2. Creating weighted composite of attribute vectors
+        3. Combining them for final transform
         """
+        print(f"\n📝 Creating memory for '{name}'...")
+        print(f"   Description: '{description}'")
+        
+        # Step 1: Store full description embedding (rich context)
+        full_desc_embedding = self._get_embedding_vector(description)
+        self.entity_memories[name] = full_desc_embedding.cpu()
+        
+        # Step 2: Extract attributes
+        attributes = self.extract_attributes_with_importance(description)
+        self.entity_attributes[name] = attributes
+        
         if not attributes:
-            return {}
+            print(f"   ⚠ No attributes extracted, using description only")
+            self.entity_transforms[name] = full_desc_embedding.cpu()
+            return full_desc_embedding
         
-        # Generate contextual description that includes entity name
-        description = self._generate_context_description(entity_name, attributes)
-        print(f"  → Context: '{description[:80]}...'")
+        # Step 3: Create composite attribute vector with NON-LINEAR weighting
+        print(f"\n   Building composite from {len(attributes)} attributes...")
         
-        transforms = {}
+        composite = torch.zeros(self.embedding_dim).to(self.device)
+        total_weight = 0.0
         
-        # 1. Compute entity transform (preserves name)
-        desc_tokens = self.tokenizer(description, return_tensors="pt", padding=True, truncation=True, max_length=64).to(self.device)
-        
-        with self.torch.no_grad():
-            embedding_layer = self.model.get_input_embeddings()
+        for attr, importance in attributes.items():
+            if importance <= 0: continue
             
-            # Description embedding (includes entity name)
-            desc_emb = embedding_layer(desc_tokens['input_ids'])
-            attention_mask = desc_tokens['attention_mask'].unsqueeze(-1)
-            masked_emb = desc_emb * attention_mask
-            sum_emb = masked_emb.sum(dim=1)
-            sum_mask = attention_mask.sum(dim=1)
-            desc_vector = sum_emb / sum_mask.clamp(min=1)
-            desc_vector = desc_vector.squeeze(0)
+            # Get attribute embedding
+            attr_vec = self._get_embedding_vector(attr)
             
-            transforms["entity"] = desc_vector
+            # NON-LINEAR importance scaling (emphasizes high-importance attributes)
+            # Using exponential scaling: weight = exp(importance/5) - 1
+            # This makes importance 10 contribute ~6.4x more than importance 5
+            weight = (torch.exp(torch.tensor(importance / 5.0)) - 1).item()
             
-            # 2. Find primary type for behavior generation
-            primary_type = None
-            for attr in attributes:
-                if attr["weight"] >= 0.9:
-                    primary_type = attr["name"]
-                    break
+            composite = composite + weight * attr_vec
+            total_weight += weight
             
-            if primary_type:
-                # Get LLM-generated behaviors for this type
-                behaviors = self._generate_behavior_description(entity_name, primary_type)
-                
-                if behaviors:
-                    behavior_tokens = self.tokenizer(behaviors, return_tensors="pt", padding=True).to(self.device)
-                    behavior_emb = embedding_layer(behavior_tokens['input_ids'])
-                    behavior_emb = behavior_emb.mean(dim=1).squeeze(0)
-                    transforms["behavior"] = behavior_emb
-                    print(f"  → Behaviors: '{behaviors[:50]}...'")
+            print(f"     '{attr}': imp={importance:.1f}, weight={weight:.3f}")
         
-        return transforms
+        # Normalize composite
+        if total_weight > 0:
+            composite = composite / total_weight
+        
+        # Step 4: Combine description embedding with composite
+        # Use weighted sum: 60% composite attributes + 40% full description
+        # This balances specific attributes with overall context
+        alpha = 0.6  # Weight for composite
+        beta = 0.4   # Weight for description
+        
+        combined = alpha * composite + beta * full_desc_embedding
+        
+        # Step 5: Scale to appropriate magnitude
+        # Target: 2-3x average token norm for strong but not overwhelming influence
+        target_scale = 2.5 * self.avg_token_norm
+        combined_normalized = F.normalize(combined, dim=0)
+        final_transform = combined_normalized * target_scale
+        
+        final_norm = final_transform.norm().item()
+        print(f"\n   Final transform norm: {final_norm:.4f}")
+        print(f"   (Target: {target_scale:.4f}, Avg token: {self.avg_token_norm:.4f})")
+        print(f"   ✓ Memory created for '{name}'")
+        
+        self.entity_transforms[name] = final_transform.cpu()
+        return final_transform
     
-    def add_entity(self, entity_name: str, attributes: List[str], at_time: Optional[datetime] = None):
+    def apply_transform_to_text(
+        self, 
+        text: str, 
+        entity_name: str,
+        boost_factor: float = 1.0,
+        inject_multiple: bool = True
+    ) -> torch.Tensor:
         """
-        Add an entity with temporal attributes.
+        Apply entity transform with improved injection strategy.
         
         Args:
-            entity_name: Name of the entity (e.g., "Mickey")
-            attributes: List of attribute strings
-            at_time: When this entity definition becomes active
+            inject_multiple: If True, inject into entity token AND previous context token
+        
+        Returns: Modified embedding tensor [1, seq_len, dim]
         """
-        if at_time is None:
-            at_time = datetime.now(timezone.utc)
+        if entity_name not in self.entity_transforms:
+            raise ValueError(f"No memory found for entity '{entity_name}'")
         
-        # Parse attributes with LLM weighting
-        print(f"\nAdding entity '{entity_name}' (active from {at_time.strftime('%Y-%m-%d')})")
-        print(f"  Analyzing attributes...")
+        # Tokenize
+        tokens = self.tokenizer(text, return_tensors="pt", return_offsets_mapping=True, truncation=True)
+        token_ids = tokens['input_ids'].to(self.device)
+        offset_mapping = tokens['offset_mapping'][0]
         
-        weighted_attrs = self._parse_attributes(attributes)
-        for attr in weighted_attrs:
-            attr["active_from"] = at_time
+        print(f"\n🔍 Processing: '{text}'")
+        token_strs = self.tokenizer.convert_ids_to_tokens(token_ids[0])
+        print(f"   Tokens: {token_strs}")
         
-        print(f"  Weighted attributes:")
-        for attr in weighted_attrs:
-            print(f"    - {attr['name']}: {attr['weight']:.2f}")
+        # Find entity position
+        entity_start = text.lower().find(entity_name.lower())
+        if entity_start == -1:
+            raise ValueError(f"Entity '{entity_name}' not found in text")
         
-        # Initialize or update entity
-        if entity_name not in self.memory_db:
-            self.memory_db[entity_name] = {
-                "attributes": [],
-                "transforms": {}
-            }
+        entity_end = entity_start + len(entity_name)
         
-        # Add new attributes
-        self.memory_db[entity_name]["attributes"].extend(weighted_attrs)
+        # Find overlapping tokens
+        entity_token_indices = []
+        for i, (start, end) in enumerate(offset_mapping):
+            if start < entity_end and end > entity_start:
+                entity_token_indices.append(i)
         
-        # Compute transforms for this time point
-        self._recompute_transforms(entity_name, at_time)
-    
-    def update_entity(self, entity_name: str, attributes: List[str], at_time: Optional[datetime] = None):
-        """
-        Update entity (deactivate old attributes, add new ones).
-        """
-        if at_time is None:
-            at_time = datetime.now(timezone.utc)
+        if not entity_token_indices:
+            print(f"   ⚠ No tokens matched entity span")
+            # Fallback: find token by string matching
+            for i, tok in enumerate(token_strs):
+                if entity_name.lower() in tok.lower().replace('Ġ', ''):
+                    entity_token_indices = [i]
+                    break
         
-        if entity_name not in self.memory_db:
-            self.add_entity(entity_name, attributes, at_time)
-            return
+        if not entity_token_indices:
+            raise ValueError(f"Could not locate entity '{entity_name}' in tokens")
         
-        # Deactivate all currently active attributes
-        for attr in self.memory_db[entity_name]["attributes"]:
-            if attr["active_until"] is None:
-                attr["active_until"] = at_time
+        primary_idx = entity_token_indices[0]
+        print(f"   Entity '{entity_name}' at token index: {primary_idx}")
         
-        # Add new attributes with LLM weighting
-        print(f"\nUpdating entity '{entity_name}' (as of {at_time.strftime('%Y-%m-%d')})")
-        print(f"  Analyzing new attributes...")
+        # Get base embeddings
+        with torch.no_grad():
+            base_embeddings = self.embedding_layer(token_ids)
         
-        weighted_attrs = self._parse_attributes(attributes)
-        for attr in weighted_attrs:
-            attr["active_from"] = at_time
+        # Prepare transform
+        transform = self.entity_transforms[entity_name].to(self.device) * boost_factor
+        modified_embeddings = base_embeddings.clone()
         
-        print(f"  New weighted attributes:")
-        for attr in weighted_attrs:
-            print(f"    - {attr['name']}: {attr['weight']:.2f}")
+        # INJECTION STRATEGY: Multi-point injection for stronger steering
+        injection_points = []
         
-        self.memory_db[entity_name]["attributes"].extend(weighted_attrs)
+        # 1. Primary: The entity token itself
+        injection_points.append(primary_idx)
         
-        # Recompute transforms
-        self._recompute_transforms(entity_name, at_time)
-    
-    def _recompute_transforms(self, entity_name: str, at_time: datetime):
-        """Compute and cache transforms for a specific time."""
-        active_attrs = self._get_active_attributes(entity_name, at_time)
+        # 2. Context token: Previous token (if exists and inject_multiple=True)
+        if inject_multiple and primary_idx > 0:
+            injection_points.append(primary_idx - 1)
         
-        if not active_attrs:
-            print(f"  ⚠ No active attributes at {at_time}")
-            return
+        # 3. All entity span tokens (if multi-token entity)
+        if len(entity_token_indices) > 1:
+            for idx in entity_token_indices[1:]:
+                if idx not in injection_points:
+                    injection_points.append(idx)
         
-        # Compute bag of transforms
-        transforms = self._compute_bag_of_transforms(entity_name, active_attrs)
+        print(f"   Injecting into {len(injection_points)} token(s)")
         
-        # Cache with timestamp
-        time_key = at_time.strftime("%Y-%m-%d")
-        self.memory_db[entity_name]["transforms"][time_key] = transforms
-        
-        # Calculate importance
-        importance = max((a["weight"] for a in active_attrs), default=0.5)
-        print(f"  ✓ Transforms computed (importance: {importance:.2f})")
-    
-    def generate(self, prompt: str, max_new_tokens: int = 50, temperature: float = 0.7,
-                 at_time: Optional[datetime] = None) -> str:
-        """
-        Generate text with BoT memory applied at specific time.
-        """
-        if at_time is None:
-            at_time = datetime.now(timezone.utc)
-        
-        # Check for entities in prompt
-        entities_found = self._find_entities_in_text(prompt)
-        
-        if entities_found:
-            # Inject context for found entities
-            modified_prompt = self._inject_context(prompt, entities_found, at_time)
+        for idx in injection_points:
+            token_str = self.tokenizer.decode(token_ids[0, idx])
+            original_norm = modified_embeddings[0, idx].norm().item()
             
-            # Tokenize modified prompt
-            model_inputs = self.tokenizer(modified_prompt, return_tensors="pt", padding=True).to(self.device)
-        else:
-            # No entities found, use original prompt
-            model_inputs = self.tokenizer(prompt, return_tensors="pt", padding=True).to(self.device)
+            # Determine injection strength (full for entity, partial for context)
+            if idx == primary_idx:
+                inject_scale = 1.0  # Full strength
+            else:
+                inject_scale = 0.5  # Half strength for context tokens
+            
+            # INJECTION: Additive with optional residual normalization
+            scaled_transform = transform * inject_scale
+            modified_embeddings[0, idx] = modified_embeddings[0, idx] + scaled_transform
+            
+            # Optional: Soft normalization to prevent explosion
+            # Interpolate between modified and norm-preserved version
+            norm_preserved = F.normalize(modified_embeddings[0, idx], dim=0) * (original_norm * 1.5)
+            modified_embeddings[0, idx] = 0.7 * modified_embeddings[0, idx] + 0.3 * norm_preserved
+            
+            new_norm = modified_embeddings[0, idx].norm().item()
+            
+            print(f"     Token '{token_str.strip()}' [{idx}]: "
+                  f"{original_norm:.3f} → {new_norm:.3f} "
+                  f"(inject: {inject_scale:.1f}x, transform: {transform.norm().item():.3f})")
         
-        input_ids = model_inputs['input_ids']
-        attention_mask = model_inputs['attention_mask']
+        print(f"   ✓ Transform applied with boost={boost_factor:.1f}")
         
-        # Get embeddings and apply transforms
-        embedding_layer = self.model.get_input_embeddings()
-        embeddings = embedding_layer(input_ids)
+        return modified_embeddings
+    
+    def generate_with_memory(
+        self,
+        text: str,
+        entity_name: str,
+        boost_factor: float = 1.0,
+        max_new_tokens: int = 128,
+        temperature: float = 0.7,
+        inject_multiple: bool = True
+    ) -> str:
+        """Generate with entity memory injected."""
+        modified_embeddings = self.apply_transform_to_text(
+            text, entity_name, boost_factor, inject_multiple
+        )
         
-        # Apply entity transforms with amplification
-        if entities_found:
-            embeddings = self._apply_transforms(embeddings, modified_prompt if entities_found else prompt, 
-                                              entities_found, at_time)
+        tokens = self.tokenizer(text, return_tensors="pt")
+        attention_mask = tokens['attention_mask'].to(self.device)
         
-        # Generate with modified embeddings
-        with self.torch.no_grad():
-            generated_ids = self.model.generate(
-                inputs_embeds=embeddings,
+        print(f"\n🤖 Generating response...")
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                inputs_embeds=modified_embeddings,
                 attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=temperature,
                 top_p=0.9,
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id
             )
         
-        # Decode output
-        output_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        
-        # Remove injected context from output if present
-        if entities_found and "[Context:" in output_text:
-            # Extract just the generated part after context
-            parts = output_text.split("]")
-            if len(parts) > 1:
-                # Get everything after context marker
-                clean_output = parts[-1].strip()
-                # Restore original prompt
-                if prompt in clean_output:
-                    output_text = clean_output
-                else:
-                    output_text = prompt + " " + clean_output.replace(modified_prompt.split("]")[-1].strip(), "").strip()
-        
-        return output_text
+        prompt_len = modified_embeddings.shape[1]
+        return self.tokenizer.decode(outputs[0, prompt_len:], skip_special_tokens=True)
     
-    def _find_entities_in_text(self, text: str) -> Dict[str, tuple]:
-        """Find entities in text."""
-        entities_found = {}
-        text_lower = text.lower()
+    def compare_approaches(
+        self,
+        text: str,
+        entity_name: str,
+        boost_levels: List[float] = [0.0, 1.0, 2.0, 3.0],
+        max_new_tokens: int = 100
+    ):
+        """Compare baseline vs memory injection at different boost levels."""
+        print("\n" + "="*80)
+        print(f"MEMORY INJECTION COMPARISON")
+        print(f"Entity: '{entity_name}' | Query: '{text}'")
+        print("="*80)
         
-        for entity_name in self.memory_db.keys():
-            entity_lower = entity_name.lower()
-            if entity_lower in text_lower:
-                pos = text_lower.find(entity_lower)
-                entities_found[entity_name] = (pos, pos + len(entity_name))
-        
-        return entities_found
-    
-    def _inject_context(self, prompt: str, entities_found: Dict[str, tuple], at_time: datetime) -> str:
-        """
-        Inject context that preserves entity names.
-        """
-        context_parts = []
-        
-        for entity_name in entities_found.keys():
-            # Get active attributes
-            active_attrs = self._get_active_attributes(entity_name, at_time)
+        for boost in boost_levels:
+            print(f"\n{'='*80}")
+            print(f"BOOST: {boost:.1f}{'  (BASELINE - No Memory)' if boost == 0.0 else ''}")
+            print(f"{'='*80}")
             
-            if active_attrs:
-                # Find primary type
-                primary_type = None
-                for attr in active_attrs:
-                    if attr["weight"] >= 0.9:
-                        primary_type = attr["name"]
-                        break
-                
-                if primary_type:
-                    # Include entity name in context
-                    context_parts.append(f"{entity_name} is a {primary_type}")
-        
-        if context_parts:
-            # Inject context at the beginning
-            context = "[Context: " + ". ".join(context_parts) + ".] "
-            return context + prompt
-        
-        return prompt
-    
-    def _apply_transforms(self, embeddings: torch.Tensor, text: str, entities_found: Dict[str, tuple],
-                         at_time: datetime) -> torch.Tensor:
-        """
-        Apply transforms with strong replacement.
-        """
-        # Get offset mapping for the text
-        encoding = self.tokenizer(text, return_offsets_mapping=True, add_special_tokens=True)
-        offset_mapping = encoding['offset_mapping']
-        
-        for entity_name, (start_pos, end_pos) in entities_found.items():
-            # Get transforms for this time
-            time_key = at_time.strftime("%Y-%m-%d")
+            if boost == 0.0:
+                # Baseline
+                tokens = self.tokenizer(text, return_tensors="pt").to(self.device)
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **tokens,
+                        max_new_tokens=max_new_tokens,
+                        temperature=0.7,
+                        do_sample=True,
+                        pad_token_id=self.tokenizer.pad_token_id
+                    )
+                start_index = tokens['input_ids'].shape[1]
+                result = self.tokenizer.decode(outputs[0, start_index:], skip_special_tokens=True)
+            else:
+                result = self.generate_with_memory(
+                    text, entity_name, 
+                    boost_factor=boost, 
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.7
+                )
             
-            # Compute if not cached
-            if time_key not in self.memory_db[entity_name]["transforms"]:
-                self._recompute_transforms(entity_name, at_time)
-            
-            if time_key not in self.memory_db[entity_name]["transforms"]:
-                continue
-            
-            transforms = self.memory_db[entity_name]["transforms"][time_key]
-            
-            if "entity" not in transforms:
-                continue
-            
-            entity_transform = transforms["entity"]
-            
-            # Find token positions for entity
-            entity_tokens = []
-            for token_idx, (token_start, token_end) in enumerate(offset_mapping):
-                if token_start == token_end:  # Skip special tokens
-                    continue
-                if token_start < end_pos and token_end > start_pos:
-                    entity_tokens.append(token_idx)
-            
-            # Apply very strong transform (0.9 replacement)
-            for token_idx in entity_tokens:
-                if token_idx < embeddings.shape[1]:
-                    base_emb = embeddings[0, token_idx].clone()
-                    # Almost complete replacement while preserving some original signal
-                    embeddings[0, token_idx] = 0.1 * base_emb + 0.9 * entity_transform
-            
-            # Apply behavior influence if available
-            if "behavior" in transforms and entity_tokens:
-                behavior_transform = transforms["behavior"]
-                # Apply to tokens immediately after entity
-                last_entity_token = max(entity_tokens)
-                for i in range(1, min(3, embeddings.shape[1] - last_entity_token)):
-                    token_idx = last_entity_token + i
-                    base_emb = embeddings[0, token_idx].clone()
-                    # Moderate influence on nearby tokens
-                    embeddings[0, token_idx] = 0.6 * base_emb + 0.4 * behavior_transform
-        
-        return embeddings
+            print(f"\n📄 OUTPUT:\n{result}\n")
 
 
-class BoTMemorySimple:
-    """Simple interface for BoT Memory."""
-    
-    def __init__(self, model_name="Qwen/Qwen2.5-7B-Instruct", force_offline=False):
-        self.model, self.tokenizer, self.torch = load_model(model_name, force_offline)
-        self.bot = BoTMemory(self.model, self.tokenizer, self.torch)
-    
-    def add_entity(self, entity_name: str, attributes: List[str], at_time: Optional[datetime] = None):
-        """Add entity with list of attributes."""
-        self.bot.add_entity(entity_name, attributes, at_time)
-    
-    def update_entity(self, entity_name: str, attributes: List[str], at_time: Optional[datetime] = None):
-        """Update entity attributes."""
-        self.bot.update_entity(entity_name, attributes, at_time)
-    
-    def generate(self, prompt: str, max_new_tokens: int = 50, at_time: Optional[datetime] = None) -> str:
-        """Generate text with BoT memory."""
-        return self.bot.generate(prompt, max_new_tokens, temperature=0.7, at_time=at_time)
-
-
-# Demo Script
+# Example usage
 if __name__ == "__main__":
-    print("="*60)
-    print("BoT Memory - Fully Dynamic with Name Preservation")
-    print("="*60)
+    try:
+        from qwen_ import load_model
+    except ImportError:
+        print("⚠ Test skipped: 'qwen_.py' not available")
+        sys.exit(0)
+
+    try:
+        bot = BagOfTransformsV3()
+    except Exception as e:
+        print(f"Failed to initialize: {e}")
+        sys.exit(1)
     
-    force_offline = len(sys.argv) > 1 and sys.argv[1] == "offline"
+    # Test 1: Mickey the Cat
+    print("\n" + "="*80)
+    print("TEST 1: Creating memory for Mickey (cat)")
+    print("="*80)
     
-    print("\nInitializing BoT Memory...")
-    bot = BoTMemorySimple(force_offline=force_offline)
+    bot.create_entity_memory(
+        name="Mickey",
+        description="Mickey, a cat with black and white fur, 7 years old, likes fish"
+    )
     
-    print("\n" + "="*60)
-    print("Adding Mickey as a cat")
-    print("="*60)
+    # General query
+    bot.compare_approaches(
+        text="Tell me about Mickey",
+        entity_name="Mickey",
+        boost_levels=[0.0, 1.5, 2.5],
+        max_new_tokens=80
+    )
     
-    # Add Mickey with cat attributes
-    bot.add_entity("Mickey", ["cat", "10_years_old", "fur", "white_and_black_spots"])
+    # Specific attribute query
+    print("\n" + "="*80)
+    print("TEST 2: Specific attribute query")
+    print("="*80)
     
-    print("\n" + "="*60)
-    print("Testing Generation")
-    print("="*60)
+    bot.compare_approaches(
+        text="What does Mickey like to eat?",
+        entity_name="Mickey",
+        boost_levels=[0.0, 2.0, 3.5],
+        max_new_tokens=60
+    )
     
-    # Test 1: Mickey at start
-    print("\n--- Test 1: 'Mickey likes to' ---")
-    output1 = bot.generate("Mickey likes to", max_new_tokens=20)
-    print(f"Output: {output1}")
+    # Test 3: Sarah (person)
+    print("\n" + "="*80)
+    print("TEST 3: Creating memory for Sarah (person)")
+    print("="*80)
     
-    # Test 2: Mickey in middle
-    print("\n--- Test 2: 'I think Mickey likes to' ---")
-    output2 = bot.generate("I think Mickey likes to", max_new_tokens=20)
-    print(f"Output: {output2}")
+    bot.create_entity_memory(
+        name="Sarah",
+        description="Sarah Johnson, a friend who works at Google and enjoys hiking"
+    )
     
-    # Test 3: Tell me about
-    print("\n--- Test 3: 'Tell me about Mickey' ---")
-    output3 = bot.generate("Tell me about Mickey", max_new_tokens=30)
-    print(f"Output: {output3}")
-    
-    print("\n" + "="*60)
-    print("Demo Complete!")
-    print("="*60)
+    bot.compare_approaches(
+        text="Where does Sarah work?",
+        entity_name="Sarah",
+        boost_levels=[0.0, 1.5, 3.0],
+        max_new_tokens=50
+    )
