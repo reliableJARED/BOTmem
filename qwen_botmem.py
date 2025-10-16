@@ -438,14 +438,14 @@ Context sentence:"""
                 (1 - blend_ratio) * original + blend_ratio * scaled_memory
             )
             
-            # Additional tokens in the span get medium injection
+            """# Additional tokens in the span get medium injection
             for idx in affected_tokens[1:]:
                 original = modified_embeddings[0, idx]
                 span_blend = 0.5 * boost_factor
                 span_blend = min(span_blend, 0.7)
                 modified_embeddings[0, idx] = (
                     (1 - span_blend) * original + span_blend * scaled_memory
-                )
+                )"""
             
             # Neighboring tokens get light injection
             for offset in [-1, 1]:
@@ -591,7 +591,7 @@ if __name__ == "__main__":
     bot.create_entity_memory(
         name="Mickey",
         description="Mickey is a 7 year old cat with black and white fur who likes to eat fish",
-        scale=4.5,
+        scale=3.5,
         is_proper_noun=True
     )
     
@@ -609,7 +609,7 @@ if __name__ == "__main__":
     bot.create_entity_memory(
         name="trash_procedure",
         description="In the office, when we take out the trash we always need to make sure we use the green bags. Never use blue bags for trash.",
-        scale=4.5,
+        scale=3.5,
         is_proper_noun=False
     )
     
@@ -627,7 +627,7 @@ if __name__ == "__main__":
     bot.create_entity_memory(
         name="Sarah",
         description="Sarah is a 32 year old software engineer who works at Google and enjoys hiking on weekends",
-        scale=4.5,
+        scale=3.5,
         is_proper_noun=True
     )
     
@@ -651,7 +651,7 @@ if __name__ == "__main__":
             "requires high-octane fuel",
             "top speed 200 mph"
         ],
-        scale=4.5,
+        scale=3.5,
         is_proper_noun=True
     )
     
@@ -770,7 +770,7 @@ if __name__ == "__main__":
     print("="*80)
     
     bot.compare_methods(
-        text="Where does Sarah work?",
+        text="I've been lurking in this community for a long time, learning so much from all of you, and I'm really grateful. I'm excited to finally be able to contribute something back in case it helps someone else. Where does Sarah work?",
         entity_name="Sarah",
         max_new_tokens=50
     )
