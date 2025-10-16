@@ -794,3 +794,93 @@ if __name__ == "__main__":
         entity_name="Brad Pitt",
         max_new_tokens=100
     )
+
+
+
+    """What the code is trying to do
+
+It implements a hybrid “memory steering” approach with two mechanisms:
+Prompt/context prefix injection: Prepend a natural-language summary of an entity’s attributes to the user prompt.
+Per-token input-embedding steering: Modify the input embedding vector(s) for the token span corresponding to the entity name, blending in a “memory embedding” derived from the entity’s description/key facts.
+It does not modify the model’s embedding matrix or any weights. The steering is applied at runtime by passing custom inputs_embeds into model.generate.
+How the “memory” vector is constructed
+
+create_entity_memory:
+Extracts simple attributes from the entity description with regex/string heuristics.
+Computes two embeddings via the model’s input embedding layer:
+desc_embedding: mean of token embeddings of the full description.
+key_facts_embedding: mean of token embeddings of a concise “key facts” string.
+Combines them (70% key facts, 30% description), then normalizes and scales the resulting vector to have a target norm of roughly 4.5× the average token embedding norm (measured from a small sample set).
+Stores this “memory embedding” plus the attributes.
+Observations:
+This “memory embedding” is a simple average of static input embeddings; it is not learned, contextual, or optimized for the concept. It’s closer to a handcrafted soft prompt vector than a trained representation.
+How the steering is applied
+
+generate_with_memory:
+Optionally injects a context prefix (string prepended to the prompt) based on extracted attributes. This is literal text injection.
+Calls apply_embedding_steering to produce modified input embeddings and an attention mask, then uses model.generate with inputs_embeds=... instead of input_ids.
+apply_embedding_steering:
+Tokenizes the (possibly prefixed) text with return_offsets_mapping=True.
+Locates the character span of the entity_name via text.lower().find(...).
+Maps that character span to token indices using the offset mapping, picks the first matching token as the “primary” entity token, and optionally includes immediate neighbors.
+Obtains the standard input embeddings for the whole prompt, clones them, and then overwrites/blends:
+Primary token embedding: new = (1 - r) * original + r * memory_vector, with r ≈ 0.8 × boost (capped at 0.95).
+Neighbor tokens: blended at a lower ratio (≈ 0.3 × boost, capped at 0.5).
+Returns the modified embeddings and mask to generate.
+Key technical detail: this is not “string replacement”
+
+The code genuinely modifies the per-token embedding vectors passed into the model at inference by using inputs_embeds. This is distinct from replacing text or swapping token IDs. It is closer to a handcrafted “soft prompt” applied to specific tokens.
+It does not permanently change the embedding layer weights; changes apply only to the current generation call.
+Important caveat/bug in current code
+
+In apply_embedding_steering, offset_mapping is requested with return_tensors="pt". For fast tokenizers, tokens['offset_mapping'] will be a torch tensor of shape [batch, seq_len, 2]. The code then does: for i, (start, end) in enumerate(offset_mapping): if start < entity_end and end > entity_start:
+Here, start and end are 0-D torch tensors, so start < entity_end returns a 0-D boolean tensor. Using Python’s and with tensors raises a “bool value of Tensor is ambiguous” error in PyTorch.
+Fix: convert to Python ints or a list first, for example: offset_mapping = tokens['offset_mapping'][0].tolist() ... start, end = pair if start < entity_end and end > entity_start: ...
+Without this fix, the steering may error out or never select any tokens.
+Also note: if a non-fast tokenizer is used, offset mappings may be missing. The code assumes availability.
+Clarity and robustness
+
+Concept clarity: The hybrid approach is clear in intent—combine explicit textual priming with latent steering at the embedding level to bias answers toward stored “memories.”
+Entity matching:
+Uses a naive substring search (lowercased) to find the entity span. This may:
+Miss multiple occurrences; only the first matched span is steered.
+Match the entity name inside other words (e.g., “Mic” in “Micro”) if not carefully specified.
+Prefer the prefix occurrence (if prefix is injected) rather than the user’s query occurrence.
+More robust would be to tokenize the entity name and search for its token-id subsequence in the encoded prompt, or at least match word boundaries in the character-level search and steer all occurrences.
+Offset mapping assumptions:
+Assumes a fast tokenizer with consistent char offsets. Case folding is done on the full text for locating entity but offsets are based on the original string. For most ASCII names this is fine; for some scripts (where lowercasing may change length or mapping), this can desync.
+Scaling and numerical behavior:
+The memory vector is normalized and then aggressively scaled to ~4.5× the average token embedding norm, and blended with up to 95% weight into the primary token, and up to 50% for neighbors.
+This can push inputs out of the distribution the model expects and create brittle or unstable behaviors. It may help “steer,” but it can also harm fluency or cause odd side effects.
+Many steering methods inject into the residual stream at later layers or use learned soft prompts to avoid over-saturating the input layer.
+“Memory” quality:
+The memory vector is a mean of input embeddings of words/phrases. This ignores context and polysemy, and is not optimized to encode the concept “correctly” for steering. It is a heuristic direction, not a learned representation.
+You may get inconsistent or weak effects compared with:
+Learned soft prompts (prefix-tuning, p-tuning v2).
+Activation steering vectors computed from contrastive datasets at specific layers.
+Simply providing clear, concise textual context (RAG-style) when latency allows.
+Efficiency and applicability:
+If you rely only on embedding steering (no prefix), you can reduce prompt length (hence minor token-level efficiency). But generation compute is essentially the same.
+The provided hybrid defaults often still add a text prefix, which is literal context injection (string prepend), not more efficient than RAG/prompting in terms of tokens.
+The approach is lightweight to set up (no fine-tuning), but effect strength and reliability will vary significantly by model and prompt.
+Edge cases and additional considerations
+
+Multi-token or repeated names: only the first match is steered; neighbors +/-1 token may be insufficient for multi-token names.
+Names not present in the prompt: steering is skipped (returns unmodified embeddings).
+Using inputs_embeds means you must take care with special tokens and attention masks. The code handles attention_mask but not position_ids; most transformer implementations derive them internally, so this is generally fine.
+Safety: Large-scale embedding overrides can cause unexpected outputs. It’s advisable to keep caps conservative and test for regressions.
+Conclusion
+
+It is not “just string replace.” The code performs real, per-call embedding steering by blending a handcrafted “memory” vector into the input embeddings for the entity token(s), and then calls generate with inputs_embeds. That said, it also optionally performs literal prompt-prefix injection; the “hybrid” method uses both.
+It does not replace or fine-tune the model’s embedding matrix; it temporarily overrides specific token embeddings at inference time. This is akin to a handcrafted soft prompt localized to an entity mention.
+Strengths:
+Simple, no training required.
+Works with standard HF generate via inputs_embeds.
+Can reduce prompt length if you skip the prefix and rely only on steering.
+Weaknesses/risks:
+There is a concrete bug in handling offset_mapping when return_tensors='pt' (must convert to Python ints/scalars). As written, this can break the token-span detection and steering.
+The “memory vector” is a naive average of input embeddings, not a learned or contextually grounded direction. Effects can be weak, noisy, or brittle.
+Aggressive scaling and blending can push inputs out-of-distribution and degrade coherence.
+Only the first entity occurrence is steered; substring matching is naive; multi-token names and multiple mentions aren’t fully handled.
+Overall evaluation:
+The approach does implement runtime embedding steering beyond mere string injection, but it is heuristic and potentially unstable. It can sometimes nudge the model toward a “memory” concept, yet it is not a principled or guaranteed improvement over simply injecting clear textual context. For reliability and controllability, consider fixing the offset_mapping bug, steering all occurrences, moderating blend/scale, or adopting learned soft prompts or activation-steering methods."""
