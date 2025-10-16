@@ -1,39 +1,27 @@
 import torch
 import torch.nn.functional as F
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import re
 import json
 import os
 import sys
 
-import torch
-import torch.nn.functional as F
-import re
-from typing import Dict, Tuple
-import sys
 
-class BagOfTransformsV4:
+class BagOfTransformsV5:
     """
-    Hybrid memory system designed for robust and reliable entity recall in Language Models.
+    Advanced hybrid memory system for robust entity and fact recall in Language Models.
 
-    This class combines two powerful memory injection techniques:
-    1. Implicit Memory: Using structured data to synthesize a natural language prompt prefix
-       (traditional prompt engineering).
-    2. Explicit Memory: Aggressively scaling a semantic memory vector (the "Bag of Transforms")
-       and surgically replacing/blending it into the input token embeddings (latent space steering).
-
-    The system stores memory as both structured attributes and a highly weighted vector,
-    ensuring that factual knowledge biases the model both linguistically and sub-symbolically.
+    Improvements over V4:
+    - Per-memory norm calibration for precise scaling
+    - Flexible memory creation from word lists or natural language
+    - LLM-assisted key fact extraction and context prefix generation
+    - Semantic search-based memory injection using embedding similarity
+    - Support for both entity memories and general fact memories
     """
     
     def __init__(self, model_name="Qwen/Qwen2.5-7B-Instruct", force_offline=False):
         """
-        Initializes the BagOfTransformsV4 hybrid memory system.
-
-        This sets up the underlying Language Model (LM), loads the tokenizer,
-        and calibrates the average token embedding norm, which is crucial for
-        determining the necessary aggressive scaling factor used during
-        embedding steering.
+        Initializes the BagOfTransformsV5 hybrid memory system.
 
         Args:
             model_name (str): The name of the Qwen model to load.
@@ -41,58 +29,63 @@ class BagOfTransformsV4:
         """
         try:
             from qwen_ import load_model
-        except ImportError:
-            print("Error: Could not import 'load_model' from 'qwen_'.")
+            import spacy
+        except ImportError as e:
+            print(f"Error: Could not import required libraries: {e}")
             sys.exit(1)
             
         self.model, self.tokenizer, self.torch = load_model(model_name, force_offline)
         
+        # Load spaCy for NLP tasks
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            print("Downloading spaCy model...")
+            import subprocess
+            subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
+            self.nlp = spacy.load("en_core_web_sm")
+        
         # Storage
-        self.entity_memories = {}        # name -> {'description': str, 'embedding': tensor, 'attributes': dict}
+        self.entity_memories = {}  # name -> memory dict
         
         self.embedding_layer = self.model.get_input_embeddings()
         self.embedding_dim = self.embedding_layer.embedding_dim
         self.device = self.model.device
         
-        self._calibrate_norms()
-        print(f"✓ Model loaded (). Embedding dimension: {self.embedding_dim}")
+        print(f"✓ Model loaded. Embedding dimension: {self.embedding_dim}")
     
-    def _calibrate_norms(self):
+    def _calibrate_norms_for_tokens(self, tokens: List[str]) -> float:
         """
-        Measures the typical L2 norm (magnitude) of token embeddings in the vocabulary.
+        Measures the typical L2 norm for a specific set of tokens.
 
-        This calibration step is essential for the embedding steering mechanism.
-        The resulting `self.avg_token_norm` is used to scale newly created memory
-        embeddings aggressively (to approximately 4.5 times the average),
-        ensuring the injected vector exerts a strong, dominant influence on the
-        model's initial layer computation.
+        This per-memory calibration ensures that each memory vector is scaled
+        appropriately relative to its own semantic content.
+
+        Args:
+            tokens (List[str]): List of words/tokens to calibrate against.
+
+        Returns:
+            float: Average norm of the token embeddings.
         """
-        sample_tokens = ["cat", "person", "Google", "fish", "seven", "works", "likes"]
         norms = []
-        
-        token_ids = self.tokenizer(sample_tokens, add_special_tokens=False)['input_ids']
+        token_ids = self.tokenizer(tokens, add_special_tokens=False)['input_ids']
         
         for ids in token_ids:
-            if not ids: continue
+            if not ids:
+                continue
             token_tensor = torch.tensor(ids).to(self.device)
             with torch.no_grad():
                 emb = self.embedding_layer(token_tensor)
                 norms.append(emb.norm(dim=-1).mean().item())
         
-        self.avg_token_norm = sum(norms) / len(norms) if norms else 1.0
-        print(f" Average token embedding norm: {self.avg_token_norm:.4f}")
+        return sum(norms) / len(norms) if norms else 1.0
     
     def _get_embedding_vector(self, text: str) -> torch.Tensor:
         """
         Calculates the mean embedding vector for a given piece of text.
 
-        This function tokenizes the input text, retrieves the individual token
-        embeddings from the model's embedding layer, and computes the arithmetic
-        mean of these vectors. This resulting vector is used as the foundational
-        semantic representation for entity memory creation.
-
         Args:
-            text (str): The input string (e.g., entity description or key facts).
+            text (str): The input string.
 
         Returns:
             torch.Tensor: A tensor of shape [D] representing the mean embedding.
@@ -108,271 +101,311 @@ class BagOfTransformsV4:
             mean_vec = embedding.mean(dim=1).squeeze(0)
         return mean_vec
     
-    def extract_attributes_simple(self, description: str) -> Dict[str, float]:
+    def _extract_key_terms_with_spacy(self, text: str) -> List[str]:
         """
-        Analyzes a natural language description to extract structured key attributes.
+        Extracts important terms from text using spaCy NLP.
 
-        This function uses regex and simple keyword matching to parse explicit facts
-        (e.g., age, type, workplace, preferences). The resulting dictionary of
-        attributes is critical for the "implicit memory" component, as it allows
-        `_inject_context_prefix` to synthesize a grammatically correct, factual
-        prompt prefix that primes the model via standard prompt engineering.
+        Focuses on proper nouns, nouns, adjectives, and numbers that convey
+        key factual information.
 
         Args:
-            description (str): The entity's full natural language description.
+            text (str): Input text to analyze.
 
         Returns:
-            Dict[str, float]: A dictionary containing structured facts.
+            List[str]: List of extracted key terms.
         """
-        attributes = {}
-        desc_lower = description.lower()
+        doc = self.nlp(text)
+        key_terms = []
         
-        # Name extraction
-        name_match = re.match(r'^(\w+)', description)
-        if name_match:
-            attributes['name'] = name_match.group(1)
+        for token in doc:
+            # Proper nouns, common nouns, adjectives, numbers
+            if token.pos_ in ['PROPN', 'NOUN', 'ADJ', 'NUM']:
+                key_terms.append(token.text)
+            # Named entities
+            elif token.ent_type_:
+                key_terms.append(token.text)
         
-        # Type/Category
-        if "cat" in desc_lower:
-            attributes['type'] = "cat"
-        elif "dog" in desc_lower:
-            attributes['type'] = "dog"
-        elif "car" in desc_lower:
-            attributes['type'] = "car"
-        elif "friend" in desc_lower or "person" in desc_lower:
-            attributes['type'] = "person"
-
-        
-        # Work/Company
-        work_match = re.search(r'works? (?:at|for) (\w+)', desc_lower)
-        if work_match:
-            attributes['works_at'] = work_match.group(1).capitalize()
-        
-        # Age
-        age_match = re.search(r'(\d+)\s*years?\s*old', desc_lower)
-        if age_match:
-            attributes['age'] = age_match.group(1)
-        
-        # Physical description
-        if "black and white" in desc_lower:
-            attributes['appearance'] = "black and white fur"
-
-        # Physical description (Car specific)
-        if "silver and white" in desc_lower:
-            attributes['appearance'] = "silver and white trim"
-
-        # Preferences/Hobbies
-        if "likes fish" in desc_lower or "fish" in desc_lower:
-            attributes['likes'] = "fish"
-        if "hiking" in desc_lower:
-            attributes['hobby'] = "hiking"
-        if "high-octane fuel" in desc_lower:
-            attributes['likes'] = "high-octane fuel"
-        
-        # Fictional Car/Chemical attributes (added context)
-        if "high-performance" in desc_lower:
-             attributes['performance'] = "high-performance"
-        if "energetic" in desc_lower:
-             attributes['danger'] = "energetic"
-        if "manufactured by" in desc_lower:
-             attributes['make'] = "foreign made"
-        
-        return attributes
+        return key_terms
     
-    def create_entity_memory(self, name: str, description: str):
+    def _generate_key_facts_with_llm(self, description: str, memory_name: str) -> str:
         """
-        Stores an entity's memory, consisting of structured attributes and an
-        aggressively scaled latent vector ("Bag of Transforms").
-
-        The process involves:
-        1. Extracting structured attributes (for implicit injection via prompt prefixing).
-        2. Creating a blended semantic embedding (70% key facts, 30% description) to focus
-           the memory vector primarily on core attributes.
-        3. Scaling this combined embedding vector to 4.5 times the average token norm.
-           This hyper-scaling is the core of the 'explicit memory' method, ensuring that
-           the injected vector dominates the original token embedding's influence during
-           `apply_embedding_steering`.
+        Uses the LLM to extract a concise key facts sentence from a description.
 
         Args:
-            name (str): The unique identifier for the entity (e.g., "Mickey").
-            description (str): The full textual description of the entity.
+            description (str): The full description or list of facts.
+            memory_name (str): The name/identifier of the memory.
+
+        Returns:
+            str: A concise key facts sentence.
+        """
+        prompt = f"""Extract the most important key facts from this description into one concise sentence.
+Focus on the core attributes that define this entity or fact.
+
+Description: {description}
+Memory name: {memory_name}
+
+Key facts (one sentence):"""
+
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=50,
+                temperature=0.3,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=self.tokenizer.pad_token_id
+            )
+        
+        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Extract only the generated part after the prompt
+        key_facts = response.split("Key facts (one sentence):")[-1].strip()
+        
+        # Clean up any extra text
+        if '\n' in key_facts:
+            key_facts = key_facts.split('\n')[0].strip()
+        
+        return key_facts
+    
+    def _generate_context_prefix_with_llm(self, memory_name: str, key_facts: str) -> str:
+        """
+        Uses the LLM to generate a natural context prefix for memory injection.
+
+        Args:
+            memory_name (str): The name/identifier of the memory.
+            key_facts (str): The key facts about the memory.
+
+        Returns:
+            str: A natural language context prefix.
+        """
+        prompt = f"""Create a brief, natural context sentence that introduces this information.
+Make it sound conversational and grammatically correct.
+
+Memory: {memory_name}
+Facts: {key_facts}
+
+Context sentence:"""
+
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=40,
+                temperature=0.4,
+                do_sample=True,
+                top_p=0.9,
+                pad_token_id=self.tokenizer.pad_token_id
+            )
+        
+        response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        context = response.split("Context sentence:")[-1].strip()
+        
+        # Clean up
+        if '\n' in context:
+            context = context.split('\n')[0].strip()
+        
+        # Ensure it ends with proper punctuation
+        if not context.endswith(('.', '!', '?')):
+            context += '.'
+        
+        return context
+    
+    def create_entity_memory(
+        self, 
+        name: str, 
+        description: Union[str, List[str]], 
+        scale: float = 4.5,
+        is_proper_noun: bool = True
+    ):
+        """
+        Stores an entity or fact memory with aggressive embedding scaling.
+
+        Args:
+            name (str): The unique identifier for the memory.
+            description (Union[str, List[str]]): Either a natural language description
+                or a list of key terms/phrases.
+            scale (float): Base scaling factor for the memory embedding (default 4.5x).
+            is_proper_noun (bool): If True, applies extra 6x scaling for proper nouns.
         """
         print(f"\n📝 Creating memory for '{name}'...")
-        print(f"Description: '{description}'")
         
-        # Extract structured attributes
-        attributes = self.extract_attributes_simple(description)
-        print(f"Extracted attributes: {attributes}")
+        # Convert description to text if it's a list
+        if isinstance(description, list):
+            description_text = " ".join(description)
+        else:
+            description_text = description
         
-        # Create embedding from description
-        desc_embedding = self._get_embedding_vector(description)
+        print(f"Description: '{description_text}'")
         
-        # Create attribute-specific embedding (for the key facts)
-        key_facts = []
-        if 'type' in attributes:
-            key_facts.append(attributes['type'])
-        if 'works_at' in attributes:
-            key_facts.append(f"works at {attributes['works_at']}")
-        if 'age' in attributes:
-            key_facts.append(f"{attributes['age']} years old")
-        if 'likes' in attributes:
-            key_facts.append(f"likes {attributes['likes']}")
-        if 'hobby' in attributes:
-            key_facts.append(f"enjoys {attributes['hobby']}")
+        # Extract key terms using spaCy
+        key_terms = self._extract_key_terms_with_spacy(description_text)
+        print(f"Extracted key terms: {key_terms}")
         
-        key_facts_text = ", ".join(key_facts)
-        print(f"Key facts: {key_facts_text}")
+        # Generate key facts using LLM
+        key_facts = self._generate_key_facts_with_llm(description_text, name)
+        print(f"LLM-generated key facts: {key_facts}")
         
-        key_facts_embedding = self._get_embedding_vector(key_facts_text)
+        # Generate context prefix using LLM
+        context_prefix = self._generate_context_prefix_with_llm(name, key_facts)
+        print(f"Context prefix: {context_prefix}")
+        
+        # Calibrate norms for this specific memory's vocabulary
+        calibration_tokens = key_terms + [name] + key_facts.split()
+        avg_token_norm = self._calibrate_norms_for_tokens(calibration_tokens)
+        print(f"Memory-specific avg token norm: {avg_token_norm:.4f}")
+        
+        # Create embeddings
+        desc_embedding = self._get_embedding_vector(description_text)
+        key_facts_embedding = self._get_embedding_vector(key_facts)
+        name_embedding = self._get_embedding_vector(name)
         
         # Combine: 70% key facts + 30% full description
         combined_embedding = 0.7 * key_facts_embedding + 0.3 * desc_embedding
         
-        # Normalize and scale aggressively
-        # Target: 4.5x average token norm for strong steering
-        target_norm = 4.5 * self.avg_token_norm
+        # Apply scaling
+        final_scale = scale
+        if is_proper_noun:
+            final_scale *= 6.0  # Extra boost for proper nouns
+            print(f"Proper noun detected - applying 6x multiplier")
+        
+        target_norm = final_scale * avg_token_norm
         final_embedding = F.normalize(combined_embedding, dim=0) * target_norm
         
-        print(f"Memory embedding norm: {final_embedding.norm().item():.4f}")
+        print(f"Memory embedding norm: {final_embedding.norm().item():.4f} (target: {target_norm:.4f})")
         
         # Store everything
         self.entity_memories[name] = {
-            'description': description,
-            'attributes': attributes,
+            'description': description_text,
+            'key_facts': key_facts,
+            'context_prefix': context_prefix,
             'embedding': final_embedding.cpu(),
-            'key_facts': key_facts_text
+            'name_embedding': name_embedding.cpu(),
+            'key_facts_embedding': key_facts_embedding.cpu(),
+            'avg_token_norm': avg_token_norm,
+            'scale': final_scale,
+            'key_terms': key_terms
         }
         
-        print(f"✓ Memory created for '{name}'")
+        print(f"✓ Memory created for '{name}' with scale {final_scale:.1f}x")
     
-    def _inject_context_prefix(self, text: str, entity_name: str) -> str:
+    def _find_memory_injection_positions(
+        self, 
+        text: str, 
+        entity_name: str,
+        similarity_threshold: float = 0.7
+    ) -> List[Tuple[int, int]]:
         """
-        Creates a grammatically natural context prefix from the stored structured
-        attributes and prepends it to the user's input text.
-
-        This mechanism implements the 'implicit memory' component of the hybrid
-        approach. By injecting factual context directly into the prompt structure,
-        it primes the Language Model to recall specific details, effectively
-        acting as a robust baseline memory retrieval technique that complements
-        the lower-level embedding steering.
+        Finds positions in text where memory should be injected using both
+        exact string matching and semantic similarity.
 
         Args:
-            text (str): The user's original query.
-            entity_name (str): The entity whose memory should be injected.
+            text (str): The input text.
+            entity_name (str): The memory name to search for.
+            similarity_threshold (float): Minimum cosine similarity for injection.
 
         Returns:
-            str: The augmented prompt string, or the original text if no memory exists.
+            List[Tuple[int, int]]: List of (start, end) character positions.
         """
+        positions = []
+        
         if entity_name not in self.entity_memories:
-            return text
+            return positions
         
         memory = self.entity_memories[entity_name]
-        attrs = memory['attributes']
         
-        # Build a natural context prefix
-        context_parts = []
+        # Method 1: Exact string matching (case-insensitive)
+        text_lower = text.lower()
+        name_lower = entity_name.lower()
+        start = 0
+        while True:
+            pos = text_lower.find(name_lower, start)
+            if pos == -1:
+                break
+            positions.append((pos, pos + len(entity_name)))
+            start = pos + 1
         
-        if 'name' in attrs and 'type' in attrs:
-            context_parts.append(f"{attrs['name']} is a {attrs['type']}")
+        # Method 2: Semantic similarity with sliding window
+        words = text.split()
+        window_size = 5
         
-        if 'age' in attrs:
-            context_parts.append(f"{attrs['age']} years old")
+        memory_name_emb = memory['name_embedding'].to(self.device)
+        memory_desc_emb = memory['embedding'].to(self.device)
+        memory_keyfacts_emb = memory['key_facts_embedding'].to(self.device)
         
-        # Attributes specific to non-human entities
-        if 'performance' in attrs:
-            context_parts.append(f"chemical {attrs['performance']}")
-        if 'danger' in attrs:
-            context_parts.append(f"energetic {attrs['danger']}")
-        if 'effect' in attrs:
-            context_parts.append(f"releases {attrs['effect']}")
-        if 'make' in attrs:
-            context_parts.append(f"always {attrs['make']}")
+        for i in range(len(words) - window_size + 1):
+            chunk = " ".join(words[i:i + window_size])
+            chunk_embedding = self._get_embedding_vector(chunk)
             
+            # Compute cosine similarities
+            sim_name = F.cosine_similarity(chunk_embedding, memory_name_emb, dim=0).item()
+            sim_desc = F.cosine_similarity(chunk_embedding, memory_desc_emb, dim=0).item()
+            sim_facts = F.cosine_similarity(chunk_embedding, memory_keyfacts_emb, dim=0).item()
+            
+            max_sim = max(sim_name, sim_desc, sim_facts)
+            
+            if max_sim >= similarity_threshold:
+                # Find character positions for this chunk
+                chunk_start = text.lower().find(chunk.lower())
+                if chunk_start != -1:
+                    chunk_end = chunk_start + len(chunk)
+                    # Avoid duplicates
+                    if not any(start <= chunk_start <= end or start <= chunk_end <= end 
+                              for start, end in positions):
+                        positions.append((chunk_start, chunk_end))
+                        print(f"   Semantic match found (sim={max_sim:.3f}): '{chunk}'")
         
-        if 'appearance' in attrs:
-            context_parts.append(f"with {attrs['appearance']}")
-        
-        if 'works_at' in attrs:
-            context_parts.append(f"who works at {attrs['works_at']}")
-        
-        if 'hobby' in attrs:
-            context_parts.append(f"and enjoys {attrs['hobby']}")
-        
-        if 'likes' in attrs:
-            context_parts.append(f"who likes {attrs['likes']}")
-        
-        if context_parts:
-            # Create a natural-sounding prefix
-            context = " ".join(context_parts) + ". "
-            # Inject it BEFORE the query
-            return context + text
-        
-        return text
+        return positions
     
     def apply_embedding_steering(
         self, 
         text: str, 
         entity_name: str,
-        boost_factor: float = 1.0
+        boost_factor: float = 1.0,
+        similarity_threshold: float = 0.7
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Applies aggressive, targeted embedding steering by modifying the input
-        token embeddings at the position of the entity name.
-
-        This is the 'explicit memory' mechanism.
-        1. The entity name tokens are located using offset mapping.
-        2. The memory vector (the 'Bag of Transforms'), which was previously
-           aggressively scaled (4.5x norm), is retrieved.
-        3. The primary entity token embedding is overwritten/blended with the
-           memory vector using a high blend ratio (80% to 95%), effectively
-           replacing the token's original semantic meaning with the stored fact vector.
-           The use of the `boost_factor` further controls the blend aggression.
-        4. Neighboring tokens receive a lesser blend (up to 50%) to diffuse the
-           memory influence locally into the surrounding context.
+        Applies embedding steering using semantic search to find injection positions.
 
         Args:
-            text (str): The full input text (potentially including the context prefix).
-            entity_name (str): The name of the entity to steer.
-            boost_factor (float): Multiplier for the memory vector strength and blend ratio.
+            text (str): The full input text.
+            entity_name (str): The name of the entity/memory to steer.
+            boost_factor (float): Multiplier for memory vector strength.
+            similarity_threshold (float): Minimum similarity for semantic injection.
 
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: (modified_embeddings, attention_mask)
         """
         if entity_name not in self.entity_memories:
-            # If no memory, return base embeddings for the text
             tokens = self.tokenizer(text, return_tensors="pt").to(self.device)
             with torch.no_grad():
-                 base_embeddings = self.embedding_layer(tokens['input_ids'])
+                base_embeddings = self.embedding_layer(tokens['input_ids'])
             return base_embeddings, tokens['attention_mask']
 
-        # Tokenize and get positional info
-        tokens = self.tokenizer(text, return_tensors="pt", return_offsets_mapping=True, truncation=True)
+        # Tokenize with offsets
+        tokens = self.tokenizer(
+            text, 
+            return_tensors="pt", 
+            return_offsets_mapping=True, 
+            truncation=True
+        )
         token_ids = tokens['input_ids'].to(self.device)
         attention_mask = tokens['attention_mask'].to(self.device)
         offset_mapping = tokens['offset_mapping'][0]
         
-        # Find entity position
-        entity_start = text.lower().find(entity_name.lower())
-        if entity_start == -1:
-            # Entity not in text, return unmodified
+        # Find all injection positions
+        injection_positions = self._find_memory_injection_positions(
+            text, entity_name, similarity_threshold
+        )
+        
+        if not injection_positions:
+            print(f"   No injection positions found for '{entity_name}'")
             with torch.no_grad():
                 base_embeddings = self.embedding_layer(token_ids)
             return base_embeddings, attention_mask
         
-        entity_end = entity_start + len(entity_name)
-        
-        # Find entity tokens (handles multi-token names)
-        entity_token_indices = []
-        for i, (start, end) in enumerate(offset_mapping):
-            # Check for overlap between token span and entity span
-            if start < entity_end and end > entity_start:
-                entity_token_indices.append(i)
-        
-        if not entity_token_indices:
-            # Fallback if tokenizer splits in an unrecoverable way
-            with torch.no_grad():
-                base_embeddings = self.embedding_layer(token_ids)
-            return base_embeddings, attention_mask
+        print(f"   Found {len(injection_positions)} injection position(s)")
         
         # Get base embeddings
         with torch.no_grad():
@@ -384,25 +417,47 @@ class BagOfTransformsV4:
         memory_embedding = self.entity_memories[entity_name]['embedding'].to(self.device)
         scaled_memory = memory_embedding * boost_factor
         
-        # AGGRESSIVE REPLACEMENT STRATEGY
-        primary_idx = entity_token_indices[0]
-        
-        # Strategy: Blend with high memory weight
-        # Blend is capped at 95% to maintain a small residue of the original token meaning.
-        blend_ratio = 0.8 * boost_factor
-        blend_ratio = min(blend_ratio, 0.95)
-        
-        original = modified_embeddings[0, primary_idx]
-        modified_embeddings[0, primary_idx] = (1 - blend_ratio) * original + blend_ratio * scaled_memory
-        
-        # Also inject (with less strength) into surrounding tokens
-        for offset in [-1, 1]:
-            neighbor_idx = primary_idx + offset
-            if 0 <= neighbor_idx < modified_embeddings.shape[1]:
-                neighbor_original = modified_embeddings[0, neighbor_idx]
-                neighbor_blend = 0.3 * boost_factor
-                neighbor_blend = min(neighbor_blend, 0.5)
-                modified_embeddings[0, neighbor_idx] = (1 - neighbor_blend) * neighbor_original + neighbor_blend * scaled_memory
+        # Apply injection at each position
+        for char_start, char_end in injection_positions:
+            # Find tokens that overlap with this character range
+            affected_tokens = []
+            for i, (tok_start, tok_end) in enumerate(offset_mapping):
+                if tok_start < char_end and tok_end > char_start:
+                    affected_tokens.append(i)
+            
+            if not affected_tokens:
+                continue
+            
+            # Primary token gets strongest injection
+            primary_idx = affected_tokens[0]
+            blend_ratio = 0.8 * boost_factor
+            blend_ratio = min(blend_ratio, 0.95)
+            
+            original = modified_embeddings[0, primary_idx]
+            modified_embeddings[0, primary_idx] = (
+                (1 - blend_ratio) * original + blend_ratio * scaled_memory
+            )
+            
+            # Additional tokens in the span get medium injection
+            for idx in affected_tokens[1:]:
+                original = modified_embeddings[0, idx]
+                span_blend = 0.5 * boost_factor
+                span_blend = min(span_blend, 0.7)
+                modified_embeddings[0, idx] = (
+                    (1 - span_blend) * original + span_blend * scaled_memory
+                )
+            
+            # Neighboring tokens get light injection
+            for offset in [-1, 1]:
+                neighbor_idx = primary_idx + offset
+                if (0 <= neighbor_idx < modified_embeddings.shape[1] and 
+                    neighbor_idx not in affected_tokens):
+                    neighbor_original = modified_embeddings[0, neighbor_idx]
+                    neighbor_blend = 0.3 * boost_factor
+                    neighbor_blend = min(neighbor_blend, 0.5)
+                    modified_embeddings[0, neighbor_idx] = (
+                        (1 - neighbor_blend) * neighbor_original + neighbor_blend * scaled_memory
+                    )
         
         return modified_embeddings, attention_mask
     
@@ -412,46 +467,37 @@ class BagOfTransformsV4:
         entity_name: str,
         boost_factor: float = 1.0,
         use_context_prefix: bool = True,
+        similarity_threshold: float = 0.7,
         max_new_tokens: int = 128,
         temperature: float = 0.7
     ) -> str:
         """
-        Orchestrates the generation process using the hybrid memory system.
-
-        The process integrates both memory mechanisms:
-        1. Implicit Memory (Optional): If `use_context_prefix` is True, a natural
-           language factual summary is prepended to the input text via
-           `_inject_context_prefix`.
-        2. Explicit Memory: The resulting (potentially modified) text is then
-           tokenized, and `apply_embedding_steering` is called to aggressively
-           inject the highly scaled memory vector directly into the input
-           embeddings at the position of the entity name.
-
-        The modified embedding sequence is then passed to the Language Model for
-        generation, ensuring the response is strongly biased by the stored facts.
+        Generates text using the hybrid memory system with semantic injection.
 
         Args:
             text (str): The user's query.
             entity_name (str): The entity key for memory retrieval.
             boost_factor (float): Strength multiplier for embedding steering.
-            use_context_prefix (bool): Whether to use prompt prefixing.
+            use_context_prefix (bool): Whether to prepend stored context.
+            similarity_threshold (float): Minimum similarity for semantic injection.
             max_new_tokens (int): Maximum tokens to generate.
             temperature (float): Sampling temperature.
 
         Returns:
             str: The generated response.
         """
-        # Step 1: Add context prefix if enabled
-        if use_context_prefix:
-            modified_text = self._inject_context_prefix(text, entity_name)
+        # Step 1: Add stored context prefix if enabled
+        if use_context_prefix and entity_name in self.entity_memories:
+            context_prefix = self.entity_memories[entity_name]['context_prefix']
+            modified_text = context_prefix + " " + text
             print(f"\n🔍 Modified prompt: '{modified_text}'")
         else:
             modified_text = text
             print(f"\n🔍 Original prompt: '{text}'")
         
-        # Step 2: Apply embedding steering
+        # Step 2: Apply embedding steering with semantic search
         modified_embeddings, attention_mask = self.apply_embedding_steering(
-            modified_text, entity_name, boost_factor
+            modified_text, entity_name, boost_factor, similarity_threshold
         )
         
         print(f"   Memory injection with boost={boost_factor:.1f}")
@@ -522,6 +568,7 @@ class BagOfTransformsV4:
             
             print(f"\n📄 OUTPUT:\n\n{result}")
 
+
 # Example usage
 if __name__ == "__main__":
     try:
@@ -531,10 +578,156 @@ if __name__ == "__main__":
         sys.exit(0)
 
     try:
-        bot = BagOfTransformsV4()
+        bot = BagOfTransformsV5()
     except Exception as e:
         print(f"Failed to initialize: {e}")
         sys.exit(1)
+    
+    # Test 1: Mickey the Cat (Proper Noun Entity)
+    print("\n" + "🐱"*40)
+    print("TEST 1: PROPER NOUN ENTITY MEMORY")
+    print("🐱"*40)
+    
+    bot.create_entity_memory(
+        name="Mickey",
+        description="Mickey is a 7 year old cat with black and white fur who likes to eat fish",
+        scale=4.5,
+        is_proper_noun=True
+    )
+    
+    bot.compare_methods(
+        text="Tell me about Mickey",
+        entity_name="Mickey",
+        max_new_tokens=100
+    )
+    
+    # Test 2: Office Procedure (General Fact Memory)
+    print("\n\n" + "🗑️"*40)
+    print("TEST 2: PROCEDURAL FACT MEMORY")
+    print("🗑️"*40)
+    
+    bot.create_entity_memory(
+        name="trash_procedure",
+        description="In the office, when we take out the trash we always need to make sure we use the green bags. Never use blue bags for trash.",
+        scale=4.5,
+        is_proper_noun=False
+    )
+    
+    bot.compare_methods(
+        text="What's the rule about taking out garbage at work?",
+        entity_name="trash_procedure",
+        max_new_tokens=100
+    )
+    
+    # Test 3: Person Entity with Multiple Attributes
+    print("\n\n" + "👤"*40)
+    print("TEST 3: PERSON ENTITY WITH MULTIPLE ATTRIBUTES")
+    print("👤"*40)
+    
+    bot.create_entity_memory(
+        name="Sarah",
+        description="Sarah is a 32 year old software engineer who works at Google and enjoys hiking on weekends",
+        scale=4.5,
+        is_proper_noun=True
+    )
+    
+    bot.compare_methods(
+        text="What do you know about Sarah?",
+        entity_name="Sarah",
+        max_new_tokens=100
+    )
+    
+    # Test 4: List-based Memory Creation
+    print("\n\n" + "🚗"*40)
+    print("TEST 4: LIST-BASED MEMORY CREATION")
+    print("🚗"*40)
+    
+    bot.create_entity_memory(
+        name="Speedster",
+        description=[
+            "high-performance sports car",
+            "silver and white trim",
+            "manufactured in Germany",
+            "requires high-octane fuel",
+            "top speed 200 mph"
+        ],
+        scale=4.5,
+        is_proper_noun=True
+    )
+    
+    bot.compare_methods(
+        text="Tell me about the Speedster vehicle",
+        entity_name="Speedster",
+        max_new_tokens=100
+    )
+    
+    # Test 5: Semantic Similarity Test (No Exact Name Match)
+    print("\n\n" + "🔍"*40)
+    print("TEST 5: SEMANTIC SIMILARITY (INDIRECT REFERENCE)")
+    print("🔍"*40)
+    
+    print("\nTesting if semantic search finds Mickey when query uses 'my pet'...")
+    result = bot.generate_with_memory(
+        text="What does my pet like to eat?",
+        entity_name="Mickey",
+        boost_factor=2.0,
+        use_context_prefix=True,
+        similarity_threshold=0.6,  # Lower threshold for this test
+        max_new_tokens=80
+    )
+    print(f"\n📄 OUTPUT:\n\n{result}")
+    
+    # Test 6: Multiple Memory Injection Points
+    print("\n\n" + "💡"*40)
+    print("TEST 6: MULTIPLE INJECTION POINTS IN SAME TEXT")
+    print("💡"*40)
+    
+    print("\nTesting multiple mentions of Sarah in one query...")
+    result = bot.generate_with_memory(
+        text="Sarah is great at her job. I wonder what Sarah does for hobbies? Does Sarah work remotely?",
+        entity_name="Sarah",
+        boost_factor=1.5,
+        use_context_prefix=False,  # Test steering-only
+        similarity_threshold=0.7,
+        max_new_tokens=100
+    )
+    print(f"\n📄 OUTPUT:\n\n{result}")
+    
+    # Test 7: Low Similarity Threshold Test
+    print("\n\n" + "⚙️"*40)
+    print("TEST 7: VARYING SIMILARITY THRESHOLDS")
+    print("⚙️"*40)
+    
+    for threshold in [0.5, 0.7, 0.9]:
+        print(f"\n--- Similarity Threshold: {threshold} ---")
+        result = bot.generate_with_memory(
+            text="What's the procedure for waste disposal?",
+            entity_name="trash_procedure",
+            boost_factor=1.5,
+            use_context_prefix=False,
+            similarity_threshold=threshold,
+            max_new_tokens=60
+        )
+        print(f"OUTPUT: {result[:200]}...")
+    
+    # Summary Statistics
+    print("\n\n" + "📊"*40)
+    print("MEMORY SYSTEM STATISTICS")
+    print("📊"*40)
+    
+    print(f"\nTotal memories stored: {len(bot.entity_memories)}")
+    for name, memory in bot.entity_memories.items():
+        print(f"\n  Memory: '{name}'")
+        print(f"    - Embedding norm: {memory['embedding'].norm().item():.2f}")
+        print(f"    - Scale factor: {memory['scale']:.1f}x")
+        print(f"    - Key facts: {memory['key_facts']}")
+        print(f"    - Context prefix: {memory['context_prefix']}")
+        print(f"    - Calibrated norm: {memory['avg_token_norm']:.4f}")
+    
+    print("\n" + "="*80)
+    print("✅ ALL TESTS COMPLETED")
+    print("="*80)
+    
     
     # Test 1: Mickey the Cat
     print("\n" + "="*80)
